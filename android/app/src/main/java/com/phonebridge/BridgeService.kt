@@ -5,9 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 class BridgeService : Service() {
@@ -15,7 +17,11 @@ class BridgeService : Service() {
     companion object {
         const val CHANNEL_ID = "PhoneBridgeChannel"
         const val NOTIFICATION_ID = 1
+        const val ACTION_ACQUIRE_WAKE = "ACQUIRE_WAKE"
+        const val ACTION_RELEASE_WAKE = "RELEASE_WAKE"
     }
+
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -26,15 +32,36 @@ class BridgeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // START_STICKY = Android will restart service if killed
+        when (intent?.action) {
+            ACTION_ACQUIRE_WAKE -> acquireWakeLock()
+            ACTION_RELEASE_WAKE -> releaseWakeLock()
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        // Restart self if destroyed
-        val restartIntent = Intent(applicationContext, BridgeService::class.java)
-        startService(restartIntent)
+        releaseWakeLock()
+        startService(Intent(applicationContext, BridgeService::class.java))
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "PhoneBridge::UploadWakeLock"
+        ).apply {
+            // Auto-release after 15 minutes as safety
+            acquire(15 * 60 * 1000L)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
+        }
+        wakeLock = null
     }
 
     private fun createNotificationChannel() {
@@ -42,7 +69,7 @@ class BridgeService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Phone Bridge",
-                NotificationManager.IMPORTANCE_MIN // no icon in status bar, no sound, no popup
+                NotificationManager.IMPORTANCE_MIN
             ).apply {
                 description = "Phone Bridge background service"
                 setShowBadge(false)
@@ -50,8 +77,8 @@ class BridgeService : Service() {
                 enableVibration(false)
                 setSound(null, null)
             }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(channel)
         }
     }
 
@@ -61,11 +88,11 @@ class BridgeService : Service() {
             ?.let { PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE) }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Phone Bridge")
+            .setContentTitle("Stress Ball")
             .setContentText("Running")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(openAppIntent)
-            .setPriority(NotificationCompat.PRIORITY_MIN)  // lowest possible priority
+            .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
             .setShowWhen(false)
             .setSilent(true)

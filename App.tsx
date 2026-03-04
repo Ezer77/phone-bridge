@@ -145,7 +145,6 @@ export default function App() {
                 transform: [
                   { scale: Animated.multiply(scaleAnim, pulseAnim) },
                 ],
-                shadowColor: glowColor as any,
               },
             ]}
           >

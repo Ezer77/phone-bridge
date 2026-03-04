@@ -24,7 +24,41 @@ class BridgeServiceModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun stop() {
+        reactApplicationContext.stopService(
+            Intent(reactApplicationContext, BridgeService::class.java)
+        )
+    }
+
+    /**
+     * Acquire a CPU wake lock before starting an upload so Android
+     * doesn't throttle the JS thread while the app is in the background.
+     */
+    @ReactMethod
+    fun acquireWakeLock() {
         val context = reactApplicationContext
-        context.stopService(Intent(context, BridgeService::class.java))
+        val intent = Intent(context, BridgeService::class.java).apply {
+            action = BridgeService.ACTION_ACQUIRE_WAKE
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
+    /**
+     * Release the wake lock after upload completes.
+     */
+    @ReactMethod
+    fun releaseWakeLock() {
+        val context = reactApplicationContext
+        val intent = Intent(context, BridgeService::class.java).apply {
+            action = BridgeService.ACTION_RELEASE_WAKE
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
     }
 }
