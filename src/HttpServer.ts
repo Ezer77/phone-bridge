@@ -1,196 +1,157 @@
 /**
- * HttpServer.ts
+ * HttpServer.ts (WebSocket client mode)
  *
- * Endpoints:
- *   GET  /ping
- *   GET  /list?type=photo|video|both&count=20&offset=0
- *   POST /send
- *     Body: {
- *       pc_host: string,
- *       pc_port?: number,       (default 8766)
- *       type?: "photo"|"video"|"both",  (default "photo")
- *       count?: number,         (default 1)
- *       offset?: number,        (default 0)
- *     }
+ * Instead of listening for connections, the phone connects OUT to the relay.
+ * Commands received from relay:
+ *   { command: "ping" }
+ *   { command: "list", type: "photo"|"video"|"both", count: 20, offset: 0 }
+ *   { command: "send", type: "photo"|"video"|"both", count: 1, offset: 0 }
  */
 
-import TcpSocket from 'react-native-tcp-socket';
-import { getMedia, uploadFile } from './FileManager';
+import { getMedia, uploadFileViaRelay } from './FileManager';
 
 type Logger = (msg: string) => void;
 
-export default class HttpServer {
-  private port: number;
+export default class RelayClient {
+  private relayHost: string;
+  private relayPort: number;
   private log: Logger;
-  private server: any = null;
+  private ws: WebSocket | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private shouldRun = false;
 
-  constructor(port: number, log: Logger) {
-    this.port = port;
+  constructor(relayHost: string, relayPort: number, log: Logger) {
+    this.relayHost = relayHost;
+    this.relayPort = relayPort;
     this.log = log;
   }
 
-  start(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.server = TcpSocket.createServer((socket) => {
-        let rawData = '';
-
-        socket.on('data', (data) => {
-          rawData += data.toString();
-          if (rawData.includes('\r\n\r\n')) {
-            this.handleRequest(rawData, socket);
-            rawData = '';
-          }
-        });
-
-        socket.on('error', (err) => {
-          this.log(`Socket error: ${err.message}`);
-        });
-      });
-
-      this.server.listen({ port: this.port, host: '0.0.0.0' }, () => {
-        resolve();
-      });
-
-      this.server.on('error', (err: any) => {
-        reject(err);
-      });
-    });
+  start() {
+    this.shouldRun = true;
+    this.connect();
   }
 
-  stop(): Promise<void> {
-    return new Promise((resolve) => {
-      if (this.server) {
-        this.server.close(() => resolve());
-      } else {
-        resolve();
-      }
-    });
-  }
-
-  private async handleRequest(raw: string, socket: any) {
-    try {
-      const [headerSection, ...bodyParts] = raw.split('\r\n\r\n');
-      const body = bodyParts.join('\r\n\r\n');
-      const firstLine = headerSection.split('\r\n')[0];
-      const [method, pathWithQuery] = firstLine.split(' ');
-
-      // Split path and query string
-      const [path, queryString] = pathWithQuery.split('?');
-      const query = this.parseQuery(queryString ?? '');
-
-      this.log(`→ ${method} ${pathWithQuery}`);
-
-      // GET /ping
-      if (method === 'GET' && path === '/ping') {
-        this.sendJson(socket, 200, { status: 'ok' });
-        return;
-      }
-
-      // GET /list?type=photo&count=20&offset=0
-      if (method === 'GET' && path === '/list') {
-        const type = (query.type as any) || 'photo';
-        const count = parseInt(query.count ?? '20');
-        const offset = parseInt(query.offset ?? '0');
-        const files = await getMedia(type, count, offset);
-        this.sendJson(socket, 200, {
-          total_returned: files.length,
-          offset,
-          files: files.map(f => ({ name: f.name, type: f.type, size: f.size })),
-        });
-        return;
-      }
-
-      // POST /send
-      if (method === 'POST' && path === '/send') {
-        let params: any = {};
-        try { params = JSON.parse(body); } catch { }
-
-        const {
-          pc_host,
-          pc_port = 8766,
-          type = 'photo',
-          count = 1,
-          offset = 0,
-        } = params;
-
-        if (!pc_host) {
-          this.sendJson(socket, 400, { error: 'pc_host is required' });
-          return;
-        }
-
-        this.sendJson(socket, 202, { status: 'accepted', type, count, offset });
-        this.uploadMedia(type, count, offset, pc_host, pc_port);
-        return;
-      }
-
-      this.sendJson(socket, 404, { error: 'Not found' });
-    } catch (e: any) {
-      this.log(`❌ Request error: ${e.message}`);
-      this.sendJson(socket, 500, { error: 'Internal error' });
+  stop() {
+    this.shouldRun = false;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
     }
   }
 
-  private parseQuery(qs: string): Record<string, string> {
-    const result: Record<string, string> = {};
-    if (!qs) return result;
-    for (const part of qs.split('&')) {
-      const [k, v] = part.split('=');
-      if (k) result[decodeURIComponent(k)] = decodeURIComponent(v ?? '');
-    }
-    return result;
-  }
+  private connect() {
+    const url = `ws://${this.relayHost}:${this.relayPort}`;
+    this.log(`🔗 Connecting to relay at ${url}...`);
 
-  private async uploadMedia(
-    type: 'photo' | 'video' | 'both',
-    count: number,
-    offset: number,
-    pcHost: string,
-    pcPort: number,
-  ) {
     try {
-      this.log(`📂 Scanning gallery (type=${type}, offset=${offset}, count=${count})...`);
-      const files = await getMedia(type, count, offset);
+      this.ws = new WebSocket(url);
 
-      if (files.length === 0) {
-        this.log('⚠️  No files found with those parameters.');
-        return;
-      }
+      this.ws.onopen = () => {
+        this.log('✅ Connected to relay');
+        // Identify as phone
+        this.ws!.send(JSON.stringify({ role: 'phone' }));
+      };
 
-      this.log(`📤 Uploading ${files.length} file(s) to ${pcHost}:${pcPort}...`);
-      let uploaded = 0;
-      let failed = 0;
-
-      for (const file of files) {
+      this.ws.onmessage = async (event) => {
         try {
-          await uploadFile(file, pcHost, pcPort);
-          this.log(`  ✅ ${file.name}`);
-          uploaded++;
-        } catch (e: any) {
-          this.log(`  ❌ ${file.name}: ${e.message}`);
-          failed++;
-        }
-      }
+          const msg = JSON.parse(event.data);
 
-      this.log(`✔️  Done: ${uploaded} uploaded, ${failed} failed.`);
+          if (msg.event === 'pc_connected') {
+            this.log('💻 PC connected to relay');
+            return;
+          }
+
+          if (msg.event === 'pc_disconnected') {
+            this.log('💻 PC disconnected');
+            return;
+          }
+
+          if (msg.command === 'ping') {
+            this.send({ event: 'pong' });
+            return;
+          }
+
+          if (msg.command === 'list') {
+            await this.handleList(msg);
+            return;
+          }
+
+          if (msg.command === 'send') {
+            await this.handleSend(msg);
+            return;
+          }
+
+        } catch (e: any) {
+          this.log(`❌ Message error: ${e.message}`);
+        }
+      };
+
+      this.ws.onerror = (e: any) => {
+        this.log(`⚠️ Connection error: ${e.message ?? 'unknown'}`);
+      };
+
+      this.ws.onclose = () => {
+        this.log('🔌 Disconnected from relay');
+        if (this.shouldRun) {
+          this.log('⏳ Reconnecting in 5s...');
+          this.reconnectTimer = setTimeout(() => this.connect(), 5000);
+        }
+      };
+
     } catch (e: any) {
-      this.log(`❌ Upload error: ${e.message}`);
+      this.log(`❌ Could not create WebSocket: ${e.message}`);
+      if (this.shouldRun) {
+        this.reconnectTimer = setTimeout(() => this.connect(), 5000);
+      }
     }
   }
 
-  private sendJson(socket: any, status: number, body: object) {
-    const json = JSON.stringify(body);
-    const statusTexts: Record<number, string> = {
-      200: 'OK', 202: 'Accepted', 400: 'Bad Request',
-      404: 'Not Found', 500: 'Internal Server Error',
-    };
-    const response =
-      `HTTP/1.1 ${status} ${statusTexts[status] ?? 'OK'}\r\n` +
-      `Content-Type: application/json\r\n` +
-      `Content-Length: ${json.length}\r\n` +
-      `Connection: close\r\n` +
-      `\r\n` +
-      json;
-    socket.write(response);
-    socket.destroy();
+  private send(obj: object) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(obj));
+    }
+  }
+
+  private async handleList(msg: any) {
+    const { type = 'photo', count = 20, offset = 0 } = msg;
+    this.log(`📋 Listing ${type}s (offset=${offset}, count=${count})`);
+    const files = await getMedia(type, count, offset);
+    this.send({
+      event: 'list_result',
+      offset,
+      files: files.map(f => ({ name: f.name, type: f.type, size: f.size })),
+    });
+  }
+
+  private async handleSend(msg: any) {
+    const { type = 'photo', count = 1, offset = 0 } = msg;
+    this.log(`📂 Scanning gallery (type=${type}, offset=${offset}, count=${count})...`);
+
+    const files = await getMedia(type, count, offset);
+
+    if (files.length === 0) {
+      this.log('⚠️  No files found');
+      this.send({ event: 'error', message: 'No files found' });
+      return;
+    }
+
+    this.log(`📤 Sending ${files.length} file(s) via relay...`);
+    let uploaded = 0;
+    let failed = 0;
+
+    for (const file of files) {
+      try {
+        await uploadFileViaRelay(file, (data) => this.send(data));
+        this.log(`  ✅ ${file.name}`);
+        uploaded++;
+      } catch (e: any) {
+        this.log(`  ❌ ${file.name}: ${e.message}`);
+        failed++;
+      }
+    }
+
+    this.send({ event: 'transfer_done', uploaded, failed });
+    this.log(`✔️  Done: ${uploaded} uploaded, ${failed} failed`);
   }
 }

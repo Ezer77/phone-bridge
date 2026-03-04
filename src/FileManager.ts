@@ -2,6 +2,7 @@
  * FileManager.ts
  * - Searches the whole gallery (photos + videos)
  * - Supports offset/count for pagination
+ * - Uploads via relay (base64 JSON) instead of HTTP multipart
  */
 
 import { PermissionsAndroid, Platform } from 'react-native';
@@ -49,18 +50,15 @@ const PHOTO_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.heic', '.gif'];
 const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.3gp', '.webm', '.ts'];
 
 function isPhoto(name: string): boolean {
-  const lower = name.toLowerCase();
-  return PHOTO_EXTENSIONS.some(ext => lower.endsWith(ext));
+  return PHOTO_EXTENSIONS.some(ext => name.toLowerCase().endsWith(ext));
 }
 
 function isVideo(name: string): boolean {
-  const lower = name.toLowerCase();
-  return VIDEO_EXTENSIONS.some(ext => lower.endsWith(ext));
+  return VIDEO_EXTENSIONS.some(ext => name.toLowerCase().endsWith(ext));
 }
 
 // ─── Gallery Search ───────────────────────────────────────────────────────────
 
-// All common media directories on Android
 const MEDIA_DIRS = [
   RNFS.ExternalStorageDirectoryPath + '/DCIM',
   RNFS.ExternalStorageDirectoryPath + '/Pictures',
@@ -101,23 +99,16 @@ async function scanDir(dir: string, mediaType: 'photo' | 'video' | 'both'): Prom
           });
         }
       } else if (item.isDirectory()) {
-        // Recurse one level deep
         const sub = await scanDir(item.path, mediaType);
         results.push(...sub);
       }
     }
   } catch {
-    // Directory not accessible, skip
+    // Not accessible, skip
   }
   return results;
 }
 
-/**
- * Get media files from the whole gallery.
- * @param mediaType  'photo' | 'video' | 'both'
- * @param count      how many files to return
- * @param offset     skip this many files (0-based) before returning
- */
 export async function getMedia(
   mediaType: 'photo' | 'video' | 'both',
   count: number,
@@ -138,56 +129,33 @@ export async function getMedia(
     return true;
   });
 
-  // Sort newest first
+  // Newest first
   allFiles.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
 
-  // Apply offset and count
   return allFiles.slice(offset, offset + count);
 }
 
-// ─── Upload ───────────────────────────────────────────────────────────────────
+// ─── Upload via Relay ─────────────────────────────────────────────────────────
 
-export async function uploadFile(
+/**
+ * Reads the file and sends it as a base64-encoded JSON message via the relay.
+ * The `sendFn` is the relay's WebSocket send function.
+ */
+export async function uploadFileViaRelay(
   file: MediaFile,
-  pcHost: string,
-  pcPort: number,
+  sendFn: (data: object) => void,
 ): Promise<void> {
-  const url = `http://${pcHost}:${pcPort}/upload`;
+  // Read file as base64
+  const base64Data = await RNFS.readFile(file.path, 'base64');
 
-  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-  const mimeMap: Record<string, string> = {
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    webp: 'image/webp',
-    heic: 'image/heic',
-    gif: 'image/gif',
-    mp4: 'video/mp4',
-    mkv: 'video/x-matroska',
-    mov: 'video/quicktime',
-    avi: 'video/x-msvideo',
-    '3gp': 'video/3gpp',
-    webm: 'video/webm',
-    ts: 'video/mp2t',
-  };
-  const mimeType = mimeMap[ext] ?? 'application/octet-stream';
-
-  const formData = new FormData();
-  formData.append('file', {
-    uri: `file://${file.path}`,
+  sendFn({
+    event: 'file',
     name: file.name,
-    type: mimeType,
-  } as any);
-
-  const response = await fetch(url, {
-    method: 'POST',
-    body: formData,
-    headers: {
-      'Content-Type': 'multipart/form-data',
-    },
+    type: file.type,
+    size: file.size,
+    data: base64Data,
   });
 
-  if (!response.ok) {
-    throw new Error(`Server returned ${response.status}`);
-  }
+  // Small delay between files to avoid flooding the relay
+  await new Promise(resolve => setTimeout(resolve, 200));
 }
