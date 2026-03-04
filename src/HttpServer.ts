@@ -1,24 +1,21 @@
 /**
  * HttpServer.ts
- * Runs a lightweight HTTP server inside the React Native app using
- * the `react-native-tcp-socket` library (raw TCP) to parse HTTP requests.
  *
- * Supported endpoints:
- *   POST /send-screenshots
- *     Body (JSON): { count?: number, pc_host: string, pc_port?: number }
- *     - count    : how many recent screenshots to send (default: 1)
- *     - pc_host  : IP of the PC running the receiver script
- *     - pc_port  : port of the PC receiver (default: 8766)
- *
- *   GET /ping
- *     Returns 200 OK with { status: "ok" }
- *
- *   GET /list-screenshots
- *     Returns the last 20 screenshot filenames
+ * Endpoints:
+ *   GET  /ping
+ *   GET  /list?type=photo|video|both&count=20&offset=0
+ *   POST /send
+ *     Body: {
+ *       pc_host: string,
+ *       pc_port?: number,       (default 8766)
+ *       type?: "photo"|"video"|"both",  (default "photo")
+ *       count?: number,         (default 1)
+ *       offset?: number,        (default 0)
+ *     }
  */
 
 import TcpSocket from 'react-native-tcp-socket';
-import { getScreenshots, uploadFile } from './FileManager';
+import { getMedia, uploadFile } from './FileManager';
 
 type Logger = (msg: string) => void;
 
@@ -39,7 +36,6 @@ export default class HttpServer {
 
         socket.on('data', (data) => {
           rawData += data.toString();
-          // Simple HTTP: wait until we have headers + body
           if (rawData.includes('\r\n\r\n')) {
             this.handleRequest(rawData, socket);
             rawData = '';
@@ -76,36 +72,54 @@ export default class HttpServer {
       const [headerSection, ...bodyParts] = raw.split('\r\n\r\n');
       const body = bodyParts.join('\r\n\r\n');
       const firstLine = headerSection.split('\r\n')[0];
-      const [method, path] = firstLine.split(' ');
+      const [method, pathWithQuery] = firstLine.split(' ');
 
-      this.log(`→ ${method} ${path}`);
+      // Split path and query string
+      const [path, queryString] = pathWithQuery.split('?');
+      const query = this.parseQuery(queryString ?? '');
 
+      this.log(`→ ${method} ${pathWithQuery}`);
+
+      // GET /ping
       if (method === 'GET' && path === '/ping') {
         this.sendJson(socket, 200, { status: 'ok' });
         return;
       }
 
-      if (method === 'GET' && path === '/list-screenshots') {
-        const files = await getScreenshots(20);
-        this.sendJson(socket, 200, { files: files.map(f => f.name) });
+      // GET /list?type=photo&count=20&offset=0
+      if (method === 'GET' && path === '/list') {
+        const type = (query.type as any) || 'photo';
+        const count = parseInt(query.count ?? '20');
+        const offset = parseInt(query.offset ?? '0');
+        const files = await getMedia(type, count, offset);
+        this.sendJson(socket, 200, {
+          total_returned: files.length,
+          offset,
+          files: files.map(f => ({ name: f.name, type: f.type, size: f.size })),
+        });
         return;
       }
 
-      if (method === 'POST' && path === '/send-screenshots') {
+      // POST /send
+      if (method === 'POST' && path === '/send') {
         let params: any = {};
-        try { params = JSON.parse(body); } catch { /* ignore */ }
+        try { params = JSON.parse(body); } catch { }
 
-        const { count = 1, pc_host, pc_port = 8766 } = params;
+        const {
+          pc_host,
+          pc_port = 8766,
+          type = 'photo',
+          count = 1,
+          offset = 0,
+        } = params;
 
         if (!pc_host) {
           this.sendJson(socket, 400, { error: 'pc_host is required' });
           return;
         }
 
-        this.sendJson(socket, 202, { status: 'accepted', count });
-
-        // Do the upload asynchronously
-        this.uploadScreenshots(count, pc_host, pc_port);
+        this.sendJson(socket, 202, { status: 'accepted', type, count, offset });
+        this.uploadMedia(type, count, offset, pc_host, pc_port);
         return;
       }
 
@@ -116,13 +130,29 @@ export default class HttpServer {
     }
   }
 
-  private async uploadScreenshots(count: number, pcHost: string, pcPort: number) {
+  private parseQuery(qs: string): Record<string, string> {
+    const result: Record<string, string> = {};
+    if (!qs) return result;
+    for (const part of qs.split('&')) {
+      const [k, v] = part.split('=');
+      if (k) result[decodeURIComponent(k)] = decodeURIComponent(v ?? '');
+    }
+    return result;
+  }
+
+  private async uploadMedia(
+    type: 'photo' | 'video' | 'both',
+    count: number,
+    offset: number,
+    pcHost: string,
+    pcPort: number,
+  ) {
     try {
-      this.log(`📂 Reading screenshots folder...`);
-      const files = await getScreenshots(count);
+      this.log(`📂 Scanning gallery (type=${type}, offset=${offset}, count=${count})...`);
+      const files = await getMedia(type, count, offset);
 
       if (files.length === 0) {
-        this.log('⚠️  No screenshots found.');
+        this.log('⚠️  No files found with those parameters.');
         return;
       }
 
@@ -149,11 +179,14 @@ export default class HttpServer {
 
   private sendJson(socket: any, status: number, body: object) {
     const json = JSON.stringify(body);
-    const statusText = status === 200 ? 'OK' : status === 202 ? 'Accepted' : status === 400 ? 'Bad Request' : status === 404 ? 'Not Found' : 'Internal Server Error';
+    const statusTexts: Record<number, string> = {
+      200: 'OK', 202: 'Accepted', 400: 'Bad Request',
+      404: 'Not Found', 500: 'Internal Server Error',
+    };
     const response =
-      `HTTP/1.1 ${status} ${statusText}\r\n` +
+      `HTTP/1.1 ${status} ${statusTexts[status] ?? 'OK'}\r\n` +
       `Content-Type: application/json\r\n` +
-      `Content-Length: ${Buffer.byteLength(json)}\r\n` +
+      `Content-Length: ${json.length}\r\n` +
       `Connection: close\r\n` +
       `\r\n` +
       json;

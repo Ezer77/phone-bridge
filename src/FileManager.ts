@@ -1,48 +1,40 @@
 /**
  * FileManager.ts
- * Handles:
- *  - Storage permission requests
- *  - Reading files from the Screenshots folder
- *  - Uploading files to the PC via multipart/form-data HTTP POST
+ * - Searches the whole gallery (photos + videos)
+ * - Supports offset/count for pagination
  */
 
 import { PermissionsAndroid, Platform } from 'react-native';
 import RNFS from 'react-native-fs';
 
-export interface ScreenshotFile {
+export interface MediaFile {
   name: string;
   path: string;
   mtime: Date;
   size: number;
+  type: 'photo' | 'video';
 }
 
-// ─── Permissions ────────────────────────────────────────────────────────────
+// ─── Permissions ─────────────────────────────────────────────────────────────
 
 export async function requestStoragePermission(): Promise<boolean> {
   if (Platform.OS !== 'android') return true;
 
   try {
-    // Android 13+ uses READ_MEDIA_IMAGES instead of READ_EXTERNAL_STORAGE
     const sdkVersion = parseInt(Platform.Version as string, 10);
 
     if (sdkVersion >= 33) {
-      const result = await PermissionsAndroid.request(
+      const results = await PermissionsAndroid.requestMultiple([
         PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
-        {
-          title: 'Photo Access',
-          message: 'Phone Bridge needs access to your photos to send screenshots.',
-          buttonPositive: 'Allow',
-        },
+        PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
+      ]);
+      return (
+        results[PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES] === PermissionsAndroid.RESULTS.GRANTED &&
+        results[PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO] === PermissionsAndroid.RESULTS.GRANTED
       );
-      return result === PermissionsAndroid.RESULTS.GRANTED;
     } else {
       const result = await PermissionsAndroid.request(
         PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
-        {
-          title: 'Storage Access',
-          message: 'Phone Bridge needs read access to your storage to send screenshots.',
-          buttonPositive: 'Allow',
-        },
       );
       return result === PermissionsAndroid.RESULTS.GRANTED;
     }
@@ -51,82 +43,151 @@ export async function requestStoragePermission(): Promise<boolean> {
   }
 }
 
-// ─── File Reading ────────────────────────────────────────────────────────────
+// ─── Extensions ──────────────────────────────────────────────────────────────
 
-const SCREENSHOT_DIRS = [
-  `${RNFS.ExternalStorageDirectoryPath}/DCIM/Screenshots`,
-  `${RNFS.ExternalStorageDirectoryPath}/Pictures/Screenshots`,
-  `${RNFS.ExternalStorageDirectoryPath}/Screenshots`,
+const PHOTO_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.heic', '.gif'];
+const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.3gp', '.webm', '.ts'];
+
+function isPhoto(name: string): boolean {
+  const lower = name.toLowerCase();
+  return PHOTO_EXTENSIONS.some(ext => lower.endsWith(ext));
+}
+
+function isVideo(name: string): boolean {
+  const lower = name.toLowerCase();
+  return VIDEO_EXTENSIONS.some(ext => lower.endsWith(ext));
+}
+
+// ─── Gallery Search ───────────────────────────────────────────────────────────
+
+// All common media directories on Android
+const MEDIA_DIRS = [
+  RNFS.ExternalStorageDirectoryPath + '/DCIM',
+  RNFS.ExternalStorageDirectoryPath + '/Pictures',
+  RNFS.ExternalStorageDirectoryPath + '/Movies',
+  RNFS.ExternalStorageDirectoryPath + '/Videos',
+  RNFS.ExternalStorageDirectoryPath + '/Download',
+  RNFS.ExternalStorageDirectoryPath + '/WhatsApp/Media/WhatsApp Images',
+  RNFS.ExternalStorageDirectoryPath + '/WhatsApp/Media/WhatsApp Video',
+  RNFS.ExternalStorageDirectoryPath + '/Telegram',
+  RNFS.ExternalStorageDirectoryPath + '/Instagram',
+  RNFS.ExternalStorageDirectoryPath + '/Snapchat',
 ];
 
-const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'];
+async function scanDir(dir: string, mediaType: 'photo' | 'video' | 'both'): Promise<MediaFile[]> {
+  const results: MediaFile[] = [];
+  try {
+    const exists = await RNFS.exists(dir);
+    if (!exists) return results;
 
-export async function getScreenshots(maxCount: number = 10): Promise<ScreenshotFile[]> {
-  let allFiles: ScreenshotFile[] = [];
+    const items = await RNFS.readDir(dir);
 
-  for (const dir of SCREENSHOT_DIRS) {
-    try {
-      const exists = await RNFS.exists(dir);
-      if (!exists) continue;
+    for (const item of items) {
+      if (item.isFile()) {
+        const isP = isPhoto(item.name);
+        const isV = isVideo(item.name);
+        const include =
+          (mediaType === 'photo' && isP) ||
+          (mediaType === 'video' && isV) ||
+          (mediaType === 'both' && (isP || isV));
 
-      const items = await RNFS.readDir(dir);
-      const images = items.filter(item =>
-        item.isFile() &&
-        IMAGE_EXTENSIONS.some(ext => item.name.toLowerCase().endsWith(ext))
-      );
-
-      const mapped: ScreenshotFile[] = images.map(item => ({
-        name: item.name,
-        path: item.path,
-        mtime: item.mtime ?? new Date(0),
-        size: item.size,
-      }));
-
-      allFiles = allFiles.concat(mapped);
-    } catch {
-      // Dir might not be accessible, skip
+        if (include) {
+          results.push({
+            name: item.name,
+            path: item.path,
+            mtime: item.mtime ?? new Date(0),
+            size: item.size,
+            type: isV ? 'video' : 'photo',
+          });
+        }
+      } else if (item.isDirectory()) {
+        // Recurse one level deep
+        const sub = await scanDir(item.path, mediaType);
+        results.push(...sub);
+      }
     }
+  } catch {
+    // Directory not accessible, skip
   }
+  return results;
+}
+
+/**
+ * Get media files from the whole gallery.
+ * @param mediaType  'photo' | 'video' | 'both'
+ * @param count      how many files to return
+ * @param offset     skip this many files (0-based) before returning
+ */
+export async function getMedia(
+  mediaType: 'photo' | 'video' | 'both',
+  count: number,
+  offset: number = 0,
+): Promise<MediaFile[]> {
+  let allFiles: MediaFile[] = [];
+
+  for (const dir of MEDIA_DIRS) {
+    const found = await scanDir(dir, mediaType);
+    allFiles = allFiles.concat(found);
+  }
+
+  // Deduplicate by path
+  const seen = new Set<string>();
+  allFiles = allFiles.filter(f => {
+    if (seen.has(f.path)) return false;
+    seen.add(f.path);
+    return true;
+  });
 
   // Sort newest first
   allFiles.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
 
-  // Return only the N most recent
-  return allFiles.slice(0, maxCount);
+  // Apply offset and count
+  return allFiles.slice(offset, offset + count);
 }
 
-// ─── File Upload ─────────────────────────────────────────────────────────────
+// ─── Upload ───────────────────────────────────────────────────────────────────
 
 export async function uploadFile(
-  file: ScreenshotFile,
+  file: MediaFile,
   pcHost: string,
   pcPort: number,
 ): Promise<void> {
   const url = `http://${pcHost}:${pcPort}/upload`;
 
-  // react-native-fs uploadFiles uses multipart form upload
-  const result = await RNFS.uploadFiles({
-    toUrl: url,
-    files: [
-      {
-        name: 'file',
-        filename: file.name,
-        filepath: file.path,
-        filetype: file.name.endsWith('.png') ? 'image/png' : 'image/jpeg',
-      },
-    ],
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  const mimeMap: Record<string, string> = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    webp: 'image/webp',
+    heic: 'image/heic',
+    gif: 'image/gif',
+    mp4: 'video/mp4',
+    mkv: 'video/x-matroska',
+    mov: 'video/quicktime',
+    avi: 'video/x-msvideo',
+    '3gp': 'video/3gpp',
+    webm: 'video/webm',
+    ts: 'video/mp2t',
+  };
+  const mimeType = mimeMap[ext] ?? 'application/octet-stream';
+
+  const formData = new FormData();
+  formData.append('file', {
+    uri: `file://${file.path}`,
+    name: file.name,
+    type: mimeType,
+  } as any);
+
+  const response = await fetch(url, {
     method: 'POST',
+    body: formData,
     headers: {
       'Content-Type': 'multipart/form-data',
     },
-    fields: {
-      filename: file.name,
-    },
-    begin: () => {},
-    progress: () => {},
-  }).promise;
+  });
 
-  if (result.statusCode !== 200) {
-    throw new Error(`Server returned ${result.statusCode}`);
+  if (!response.ok) {
+    throw new Error(`Server returned ${response.status}`);
   }
 }
